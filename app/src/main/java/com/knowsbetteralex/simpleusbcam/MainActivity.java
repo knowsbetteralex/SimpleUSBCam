@@ -2,6 +2,12 @@ package com.knowsbetteralex.simpleusbcam;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.hardware.usb.UsbDevice;
@@ -22,6 +28,9 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.util.Log;
+import android.app.AlertDialog;
+import java.util.Locale;
 
 import com.jiangdg.ausbc.MultiCameraClient;
 import com.jiangdg.ausbc.base.CameraActivity;
@@ -40,6 +49,8 @@ import com.jiangdg.ausbc.widget.IAspectRatio;
  */
 public final class MainActivity extends CameraActivity {
     private static final int PERMISSION_REQUEST = 100;
+    private static final String USB_ACTION = "com.knowsbetteralex.simpleusbcam.USB_PERMISSION";
+    private static final String TAG = "SimpleUSBCam";
     private static final int ENDO_VID = 0x349c;
     private static final int ENDO_PID = 0x0411;
     private static final int BG = 0xff10161c;
@@ -56,6 +67,12 @@ public final class MainActivity extends CameraActivity {
     private TextView timeLabel;
     private Button recordButton;
     private Button micButton;
+    private Button recordButtonUnused; // UI reference retained for stability
+    private TextView usbDetails;
+    private boolean usbPermissionPending;
+    private boolean usbReceiverRegistered;
+    private boolean pendingMicChange;
+    private final StringBuilder trace = new StringBuilder();
     private MicLevelMonitor meter;
     private boolean foreground = false;
     private boolean recording = false;
@@ -64,6 +81,26 @@ public final class MainActivity extends CameraActivity {
     private long startedAt;
     private long lastCableButtonAt;
     private Object uvcButtonCallback;
+    private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!USB_ACTION.equals(intent.getAction())) return;
+            UsbDevice device;
+            if (Build.VERSION.SDK_INT >= 33) {
+                device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+            } else {
+                device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            }
+            usbPermissionPending = false;
+            boolean granted = device != null && intent.getBooleanExtra(
+                    UsbManager.EXTRA_PERMISSION_GRANTED, false);
+            addTrace("USB permission callback: " + (granted ? "GRANTED" : "DENIED"));
+            if (granted) {
+                showStatus("USB-разрешение получено, открываем видеопоток...");
+                ui.postDelayed(() -> requestPermission(device), 350);
+            } else showStatus("Доступ к USB не предоставлен; нажмите USB");
+            updateUsbDetails();
+        }
+    };
 
     private final Runnable timeTick = new Runnable() {
         @Override public void run() {
@@ -100,6 +137,12 @@ public final class MainActivity extends CameraActivity {
         header.addView(title, new LinearLayout.LayoutParams(0, dp(38), 1));
         timeLabel = text("00:00", 16, GREEN);
         header.addView(timeLabel);
+        Button usbButton = button("USB", SURFACE);
+        header.addView(usbButton, new LinearLayout.LayoutParams(dp(62), dp(37)));
+        usbButton.setOnClickListener(v -> {
+            addTrace("Manual USB reconnect requested");
+            retryUsb(true);
+        });
         root.addView(header);
 
         cameraContainer = new FrameLayout(this);
@@ -114,6 +157,10 @@ public final class MainActivity extends CameraActivity {
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(30));
         root.addView(status, slp);
+        usbDetails = text("Поиск USB...", 11, 0xff8fa5b1);
+        usbDetails.setOnClickListener(v -> showDiagnostics());
+        root.addView(usbDetails, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(27)));
 
         LinearLayout audioRow = new LinearLayout(this);
         audioRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -155,12 +202,7 @@ public final class MainActivity extends CameraActivity {
         micButton.setOnClickListener(v -> toggleMicrophone());
         rotate.setOnClickListener(v -> {
             rotation = (rotation + 1) % 4;
-            if (isCameraOpened()) {
-                setRotateType(new RotateType[] {
-                    RotateType.ANGLE_0, RotateType.ANGLE_90,
-                    RotateType.ANGLE_180, RotateType.ANGLE_270
-                }[rotation]);
-            }
+            cameraView.setRotation(rotation * 90f);
         });
         return root;
     }
@@ -177,7 +219,7 @@ public final class MainActivity extends CameraActivity {
         return new CameraRequest.Builder()
                 .setPreviewWidth(640)
                 .setPreviewHeight(480)
-                .setRenderMode(CameraRequest.RenderMode.OPENGL)
+                .setRenderMode(CameraRequest.RenderMode.NORMAL)
                 .setPreviewFormat(CameraRequest.PreviewFormat.FORMAT_MJPEG)
                 .setAudioSource(micEnabled
                         ? CameraRequest.AudioSource.SOURCE_SYS_MIC
@@ -198,7 +240,9 @@ public final class MainActivity extends CameraActivity {
 
     @Override protected void initData() {
         micButton.setText(micEnabled ? "Микрофон: ВКЛ" : "Микрофон: ВЫКЛ");
+        registerOwnUsbReceiver();
         requestAppPermissions();
+        ui.postDelayed(() -> retryUsb(false), 2200);
     }
 
     private void requestAppPermissions() {
@@ -223,8 +267,8 @@ public final class MainActivity extends CameraActivity {
         if (checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             showStatus("Разрешите доступ к камере Android");
-        } else if (getCurrentCamera() != null && !isCameraOpened()) {
-            openCamera(cameraView);
+        } else {
+            ui.postDelayed(() -> retryUsb(false), 600);
         }
         if (micEnabled && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED && foreground)
@@ -237,25 +281,30 @@ public final class MainActivity extends CameraActivity {
         runOnUiThread(() -> {
             switch (state) {
                 case OPENED:
-                    attachUvcButton(camera);
+                    pendingMicChange = false;
+                    recordButton.setEnabled(true);
+                    addTrace("UVC OPENED: " + camera.getCameraRequest().getPreviewWidth() + "x" + camera.getCameraRequest().getPreviewHeight());
+                    // Avoid native UVC button proxy until the JNI lifetime is verified.
                     setEncodeDataCallBack((type, data, offset, size, pts) -> {
                         if (type == IEncodeDataCallBack.DataType.AAC && recording)
                             meter.offerAac(data, offset, size);
                     });
-                    setRotateType(new RotateType[] {
-                        RotateType.ANGLE_0, RotateType.ANGLE_90,
-                        RotateType.ANGLE_180, RotateType.ANGLE_270
-                    }[rotation]);
-                    showStatus("Эндоскоп подключён • 640×480");
+                    cameraView.setRotation(rotation * 90f);
+                    showStatus("Видео открыто • " + camera.getCameraRequest().getPreviewWidth()
+                            + "×" + camera.getCameraRequest().getPreviewHeight());
+                    updateUsbDetails();
                     break;
                 case CLOSED:
+                    addTrace("UVC CLOSED");
                     uvcButtonCallback = null;
                     if (recording) stopVideo();
                     showStatus("USB-камера отключена");
                     break;
                 case ERROR:
+                    addTrace("UVC ERROR: " + message);
                     if (recording) stopVideo();
                     showStatus("Ошибка USB: " + (message == null ? "неизвестно" : message));
+                    updateUsbDetails();
                     break;
                 default: break;
             }
@@ -292,6 +341,10 @@ public final class MainActivity extends CameraActivity {
     }
 
     private void startVideo() {
+        if (pendingMicChange) {
+            showStatus("Переподключите эндоскоп, чтобы применить режим микрофона");
+            return;
+        }
         if (!isCameraOpened()) {
             showStatus("Сначала подключите эндоскоп");
             return;
@@ -348,22 +401,123 @@ public final class MainActivity extends CameraActivity {
         getSharedPreferences("settings", MODE_PRIVATE).edit()
                 .putBoolean("mic", micEnabled).apply();
         micButton.setText(micEnabled ? "Микрофон: ВКЛ" : "Микрофон: ВЫКЛ");
-        if (micEnabled) requestAppPermissions(); else {
+
+        if (micEnabled) requestAppPermissions();
+        else {
             meter.stopAll();
             meterBar.setProgress(0);
         }
+        // Native UVC camera teardown/reopen in the same click caused a crash
+        // on the user's device. Leave the video pipeline untouched.
         if (isCameraOpened()) {
-            showStatus("Перезапуск камеры для смены источника звука...");
-            closeCamera();
-            ui.postDelayed(() -> {
-                if (foreground) openCamera(cameraView);
-            }, 650);
+            pendingMicChange = true;
+            recordButton.setEnabled(false);
+            showStatus("Режим микрофона сохранён. Для видео переподключите USB.");
+            addTrace("Mic toggled; pending until next USB connection");
+        } else {
+            pendingMicChange = false;
+            showStatus(micEnabled ? "Микрофон включён" : "Микрофон выключен");
         }
+    }
+
+    private void registerOwnUsbReceiver() {
+        if (usbReceiverRegistered) return;
+        IntentFilter filter = new IntentFilter(USB_ACTION);
+        if (Build.VERSION.SDK_INT >= 33)
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(usbPermissionReceiver, filter);
+        usbReceiverRegistered = true;
+    }
+
+    private void retryUsb(boolean userAction) {
+        updateUsbDetails();
+        if (isCameraOpened()) {
+            showStatus("Видеопоток открыт. Если экран чёрный — переподключите кабель.");
+            return;
+        }
+        UsbDevice device = getDefaultCamera();
+        if (device == null) {
+            showStatus("Не найден эндоскоп 349C:0411 • проверьте USB OTG");
+            return;
+        }
+        UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+        if (manager == null) return;
+        if (checkSelfPermission(Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            showStatus("Нужно разрешение на камеру");
+            if (userAction) requestAppPermissions();
+            return;
+        }
+        if (manager.hasPermission(device)) {
+            showStatus("USB разрешён — запрашиваем видеопоток...");
+            addTrace("USB granted; AUSBC connect requested");
+            requestPermission(device);
+        } else if (!usbPermissionPending) {
+            try {
+                usbPermissionPending = true;
+                Intent intent = new Intent(USB_ACTION).setPackage(getPackageName());
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+                PendingIntent pi = PendingIntent.getBroadcast(this, 44, intent, flags);
+                manager.requestPermission(device, pi);
+                showStatus("Разрешите доступ к эндоскопу в системном окне");
+                addTrace("Requested USB permission via mutable PendingIntent");
+            } catch (Exception e) {
+                usbPermissionPending = false;
+                addTrace("USB permission request failed: " + e);
+                showStatus("Ошибка разрешения USB: " + e.getMessage());
+            }
+        }
+    }
+
+    private void updateUsbDetails() {
+        if (usbDetails == null) return;
+        UsbDevice device = getDefaultCamera();
+        UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+        if (device == null) {
+            usbDetails.setText("USB: камера 349C:0411 не найдена • нажмите для диагностики");
+        } else {
+            boolean permitted = manager != null && manager.hasPermission(device);
+            usbDetails.setText("USB 349C:0411 • доступ " +
+                (permitted ? "есть" : "нет") + " • UVC " +
+                (isCameraOpened() ? "OPEN" : "WAIT") + " • диагностика ↗");
+        }
+    }
+
+    private void addTrace(String message) {
+        Log.i(TAG, message);
+        trace.append(SystemClock.elapsedRealtime()).append(": ")
+                .append(message).append('\n');
+        if (trace.length() > 7000) trace.delete(0, trace.length() - 6000);
+    }
+
+    private void showDiagnostics() {
+        updateUsbDetails();
+        String report = "SimpleUSBCam " + Build.VERSION.RELEASE +
+                " / API " + Build.VERSION.SDK_INT +
+                "\nUSB: " + (usbDetails == null ? "-" : usbDetails.getText()) +
+                "\nCamera: " + (isCameraOpened() ? "OPEN" : "WAIT") +
+                "\nMIC: " + micEnabled + "\n\nEvents:\n" + trace;
+        new AlertDialog.Builder(this)
+                .setTitle("Диагностика USB")
+                .setMessage(report)
+                .setPositiveButton("Копировать", (dialog, which) -> {
+                    android.content.ClipboardManager clip =
+                            (android.content.ClipboardManager)
+                                    getSystemService(CLIPBOARD_SERVICE);
+                    if (clip != null) {
+                        clip.setPrimaryClip(android.content.ClipData.newPlainText(
+                                "SimpleUSBCam diagnostics", report));
+                        Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Закрыть", null).show();
     }
 
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        updateUsbDetails();
         if (meter != null && micEnabled && !recording &&
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                         == PackageManager.PERMISSION_GRANTED)
@@ -380,6 +534,11 @@ public final class MainActivity extends CameraActivity {
     @Override protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
         if (meter != null) meter.stopAll();
+        if (usbReceiverRegistered) {
+            try { unregisterReceiver(usbPermissionReceiver); }
+            catch (IllegalArgumentException ignored) { }
+            usbReceiverRegistered = false;
+        }
         super.onDestroy();
     }
 
