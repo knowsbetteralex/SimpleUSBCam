@@ -81,9 +81,8 @@ public final class MainActivity extends CameraActivity {
         meter = new MicLevelMonitor(level -> {
             if (meterBar != null) {
                 meterBar.setProgress((int) (100 * level));
-                meterLabel.setText(level < .01f ? "−∞ dB" :
-                    String.format(java.util.Locale.US, "%.0f dB",
-                            20 * Math.log10(Math.max(.00001f, level))));
+                meterLabel.setText(String.format(java.util.Locale.US,
+                        "%d %%", Math.round(level * 100)));
             }
         });
 
@@ -128,7 +127,7 @@ public final class MainActivity extends CameraActivity {
                 0, dp(14), 1);
         meterLp.setMargins(dp(9), 0, dp(10), 0);
         audioRow.addView(meterBar, meterLp);
-        meterLabel = text("−∞ dB", 12, WHITE);
+        meterLabel = text("0 %", 12, WHITE);
         meterLabel.setMinWidth(dp(57));
         audioRow.addView(meterLabel);
         root.addView(audioRow, new LinearLayout.LayoutParams(
