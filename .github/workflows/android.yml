@@ -33,6 +33,6 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: SimpleUSBCam test build ${{ github.run_number }}
-          prerelease: true
+          prerelease: false
           files: app/build/outputs/apk/debug/app-debug.apk
           body: "Тестовая сборка. Подпись debug, при переустановке может понадобиться удалить предыдущую сборку."
