@@ -85,7 +85,14 @@ public final class MicLevelMonitor {
         if (ar != null) {
             try { ar.stop(); } catch (Exception ignored) { }
         }
-        // The worker releases AudioRecord in its finally block.
+        // Let the reader release its recorder before AUSBC opens its own.
+        Thread t = idleThread;
+        if (t != null && t != Thread.currentThread()) {
+            try { t.join(400); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        idleThread = null;
     }
 
     public synchronized void startDecoder() {
