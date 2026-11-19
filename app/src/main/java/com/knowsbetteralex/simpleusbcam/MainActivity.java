@@ -62,6 +62,8 @@ public final class MainActivity extends CameraActivity {
     private boolean micEnabled = true;
     private int rotation = 0;
     private long startedAt;
+    private long lastCableButtonAt;
+    private Object uvcButtonCallback;
 
     private final Runnable timeTick = new Runnable() {
         @Override public void run() {
@@ -235,6 +237,7 @@ public final class MainActivity extends CameraActivity {
         runOnUiThread(() -> {
             switch (state) {
                 case OPENED:
+                    attachUvcButton(camera);
                     setEncodeDataCallBack((type, data, offset, size, pts) -> {
                         if (type == IEncodeDataCallBack.DataType.AAC && recording)
                             meter.offerAac(data, offset, size);
@@ -246,6 +249,7 @@ public final class MainActivity extends CameraActivity {
                     showStatus("Эндоскоп подключён • 640×480");
                     break;
                 case CLOSED:
+                    uvcButtonCallback = null;
                     if (recording) stopVideo();
                     showStatus("USB-камера отключена");
                     break;
@@ -379,8 +383,48 @@ public final class MainActivity extends CameraActivity {
         super.onDestroy();
     }
 
-    // Some endoscopes generate an Android key code; others send a UVC
-    // still-image event on the video-control interrupt endpoint instead.
+    /**
+     * AUSBC owns a native UVC camera and its status endpoint. Its UVC library
+     * already exposes setButtonCallback, but the higher-level CameraUVC class
+     * does not expose that method. Reflection only accesses our third-party
+     * library's private camera field (not Android's hidden framework APIs).
+     * A strong reference to the callback is retained for the camera lifetime.
+     */
+    private void attachUvcButton(MultiCameraClient.ICamera camera) {
+        try {
+            java.lang.reflect.Field f = camera.getClass()
+                    .getDeclaredField("mUvcCamera");
+            f.setAccessible(true);
+            Object nativeCamera = f.get(camera);
+            if (nativeCamera == null) return;
+            Class<?> cbType = Class.forName("com.jiangdg.uvc.IButtonCallback");
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(
+                    cbType.getClassLoader(), new Class<?>[] { cbType },
+                    (proxy, method, args) -> {
+                        if ("onButton".equals(method.getName())
+                                && args != null && args.length == 2
+                                && ((Integer) args[1]) != 0) {
+                            runOnUiThread(() -> {
+                                long now = SystemClock.elapsedRealtime();
+                                if (now - lastCableButtonAt > 450) {
+                                    lastCableButtonAt = now;
+                                    takePhoto();
+                                }
+                            });
+                        }
+                        return null;
+                    });
+            java.lang.reflect.Method setCallback = nativeCamera.getClass()
+                    .getMethod("setButtonCallback", cbType);
+            setCallback.invoke(nativeCamera, cb);
+            uvcButtonCallback = cb;
+        } catch (ReflectiveOperationException | SecurityException ex) {
+            android.util.Log.w("SimpleUSBCam",
+                    "UVC button callback unavailable", ex);
+        }
+    }
+
+    // Fallback for endoscopes that dispatch Android camera key events.
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (event.getAction() == KeyEvent.ACTION_DOWN &&
                 event.getRepeatCount() == 0 &&
