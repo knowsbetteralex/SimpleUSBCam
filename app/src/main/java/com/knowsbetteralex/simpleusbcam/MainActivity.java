@@ -33,6 +33,7 @@ import android.widget.Toast;
 import android.util.Log;
 import android.app.AlertDialog;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.jiangdg.ausbc.MultiCameraClient;
 import com.jiangdg.ausbc.base.CameraActivity;
@@ -85,11 +86,18 @@ public final class MainActivity extends CameraActivity {
     private LivePreview livePreview;
     private ImageView previewOverlay;
     private Button videoModeButton;
+    private Button previewModeButton;
+    private int fpsPreviousFrames;
+    private int fpsPreviousDisplayed;
+    private long fpsLastAt;
+    private float cameraFps;
+    private float screenFps;
     private long recordBeganAt;
     private boolean recordingActive;
     private final Runnable previewTick = new Runnable() {
         @Override public void run() {
             if (livePreview != null) {
+                calculateFps();
                 updateUsbDetails();
                 if (isCameraOpened() && livePreview.getFrames() == 0
                         && SystemClock.elapsedRealtime() - livePreview.getOpenedAt() > 3000
@@ -186,6 +194,11 @@ public final class MainActivity extends CameraActivity {
         formatRow.addView(videoModeButton,
                 new LinearLayout.LayoutParams(dp(93), dp(34)));
         videoModeButton.setOnClickListener(v -> chooseVideoMode());
+        previewModeButton = button("ПРОГ", SURFACE);
+        previewModeButton.setTextSize(10);
+        formatRow.addView(previewModeButton,
+                new LinearLayout.LayoutParams(dp(65), dp(34)));
+        previewModeButton.setOnClickListener(v -> togglePreviewMode());
         root.addView(formatRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(36)));
 
@@ -283,9 +296,14 @@ public final class MainActivity extends CameraActivity {
         livePreview = new LivePreview(previewOverlay, result -> {
             if (result == 1) {
                 addTrace("FIRST FRAME received");
-                showStatus("Видеокадры поступают • программный предпросмотр");
+                showStatus("Видеокадры поступают • " +
+                        (livePreview.isSoftwareEnabled() ? "программный" : "аппаратный") +
+                        " предпросмотр");
             }
         });
+        livePreview.setSoftwareEnabled(getSharedPreferences("settings", MODE_PRIVATE)
+                .getBoolean("software_preview", true));
+        updatePreviewModeButton();
         recordButton.setEnabled(false);
         ui.post(previewTick);
         requestAppPermissions();
@@ -300,6 +318,10 @@ public final class MainActivity extends CameraActivity {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED)
             required.add(Manifest.permission.RECORD_AUDIO);
+        if (Build.VERSION.SDK_INT <= 28 &&
+                checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED)
+            required.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         if (!required.isEmpty()) {
             requestPermissions(required.toArray(new String[0]), PERMISSION_REQUEST);
         } else if (foreground && micEnabled && !recording) {
@@ -330,6 +352,11 @@ public final class MainActivity extends CameraActivity {
                 case OPENED:
                     pendingMicChange = false;
                     recordButton.setEnabled(false);
+                    fpsPreviousFrames = 0;
+                    fpsPreviousDisplayed = 0;
+                    fpsLastAt = 0;
+                    cameraFps = 0;
+                    screenFps = 0;
                     livePreview.reset();
                     camera.addPreviewDataCallBack(livePreview);
                     addTrace("UVC OPENED: " + camera.getCameraRequest().getPreviewWidth()
@@ -372,6 +399,7 @@ public final class MainActivity extends CameraActivity {
     }
 
     private ICaptureCallBack captureCallback(String kind) {
+        final AtomicBoolean galleryExportStarted = new AtomicBoolean(false);
         return new ICaptureCallBack() {
             @Override public void onBegin() {
                 ui.post(() -> {
@@ -395,11 +423,24 @@ public final class MainActivity extends CameraActivity {
                 });
             }
             @Override public void onComplete(String path) {
+                if (!galleryExportStarted.compareAndSet(false, true)) return;
                 ui.post(() -> {
-                    showStatus(kind + " сохранено" +
-                            (path == null ? "" : ": " + path));
+                    showStatus(kind + ": добавляем в галерею...");
                     if (recording && "Видео".equals(kind)) finishRecordingUi();
                 });
+                GallerySaver.export(MainActivity.this, path, "Видео".equals(kind),
+                        (uri, error) -> ui.post(() -> {
+                            if (error == null) {
+                                showStatus(kind + " в галерее • SimpleUSBCam");
+                                addTrace(kind + " saved in MediaStore: " + uri);
+                                Toast.makeText(MainActivity.this,
+                                        kind + " сохранено в галерею", Toast.LENGTH_LONG).show();
+                            } else {
+                                showStatus(kind + " сохранено в папке приложения; " +
+                                        "ошибка галереи: " + error);
+                                addTrace("Gallery export error: " + error + " source=" + path);
+                            }
+                        }));
             }
         };
     }
@@ -573,9 +614,10 @@ public final class MainActivity extends CameraActivity {
         } else {
             boolean permitted = manager != null && manager.hasPermission(device);
             usbDetails.setText("USB 349C:0411 • " +
-                (permitted ? "разрешено" : "нет доступа") + " • " +
+                (permitted ? "OK" : "нет доступа") + " • " +
                 (isCameraOpened() ? "OPEN" : "WAIT") +
-                " • кадров " + (livePreview == null ? 0 : livePreview.getFrames()) +
+                " • FPS " + String.format(Locale.US, "%.1f", cameraFps) +
+                "/" + String.format(Locale.US, "%.1f", screenFps) +
                 " • журнал ↗");
             if (isCameraOpened() && livePreview != null && livePreview.getFrames() > 2
                     && livePreview.getLastFrameAgeMs() < 2500
@@ -599,6 +641,10 @@ public final class MainActivity extends CameraActivity {
                 "\nMIC: " + micEnabled +
                 "\nMode: " + getVideoModeLabel() +
                 "\nFrames: " + (livePreview == null ? "-" : livePreview.getFrames()) +
+                "\nDisplayed: " + (livePreview == null ? "-" : livePreview.getDisplayedFrames()) +
+                "\nFPS USB / screen: " + cameraFps + " / " + screenFps +
+                "\nPreview: " + (livePreview == null ? "-" :
+                        (livePreview.isSoftwareEnabled() ? "software" : "native")) +
                 "\nLast frame age (ms): " + (livePreview == null ? "-" : livePreview.getLastFrameAgeMs()) +
                 "\n\nEvents:\n" + trace;
         new AlertDialog.Builder(this)
@@ -615,6 +661,44 @@ public final class MainActivity extends CameraActivity {
                     }
                 })
                 .setNegativeButton("Закрыть", null).show();
+    }
+
+    private void calculateFps() {
+        if (livePreview == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (fpsLastAt > 0 && now - fpsLastAt >= 400) {
+            int frames = livePreview.getFrames();
+            int displayed = livePreview.getDisplayedFrames();
+            float seconds = (now - fpsLastAt) / 1000f;
+            cameraFps = Math.max(0, (frames - fpsPreviousFrames) / seconds);
+            screenFps = livePreview.isSoftwareEnabled()
+                    ? Math.max(0, (displayed - fpsPreviousDisplayed) / seconds)
+                    : -1f;
+            fpsPreviousFrames = frames;
+            fpsPreviousDisplayed = displayed;
+        } else if (fpsLastAt == 0) {
+            fpsPreviousFrames = livePreview.getFrames();
+            fpsPreviousDisplayed = livePreview.getDisplayedFrames();
+        }
+        fpsLastAt = now;
+    }
+
+    private void updatePreviewModeButton() {
+        if (previewModeButton != null && livePreview != null) {
+            previewModeButton.setText(livePreview.isSoftwareEnabled() ? "ПРОГ" : "АПП");
+        }
+    }
+
+    private void togglePreviewMode() {
+        if (livePreview == null) return;
+        boolean next = !livePreview.isSoftwareEnabled();
+        livePreview.setSoftwareEnabled(next);
+        getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .putBoolean("software_preview", next).apply();
+        updatePreviewModeButton();
+        addTrace("Preview mode changed to " + (next ? "software" : "native"));
+        showStatus(next ? "Программный предпросмотр (оптимизирован)" :
+                "Аппаратный предпросмотр; если экран чёрный, верните ПРОГ");
     }
 
     private String getVideoModeLabel() {
