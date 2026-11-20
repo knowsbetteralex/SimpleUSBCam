@@ -25,6 +25,8 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ImageView;
+import com.jiangdg.ausbc.callback.IPreviewDataCallBack;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -67,7 +69,6 @@ public final class MainActivity extends CameraActivity {
     private TextView timeLabel;
     private Button recordButton;
     private Button micButton;
-    private Button recordButtonUnused; // UI reference retained for stability
     private TextView usbDetails;
     private boolean usbPermissionPending;
     private boolean usbReceiverRegistered;
@@ -81,6 +82,24 @@ public final class MainActivity extends CameraActivity {
     private long startedAt;
     private long lastCableButtonAt;
     private Object uvcButtonCallback;
+    private LivePreview livePreview;
+    private ImageView previewOverlay;
+    private Button videoModeButton;
+    private long recordBeganAt;
+    private boolean recordingActive;
+    private final Runnable previewTick = new Runnable() {
+        @Override public void run() {
+            if (livePreview != null) {
+                updateUsbDetails();
+                if (isCameraOpened() && livePreview.getFrames() == 0
+                        && SystemClock.elapsedRealtime() - livePreview.getOpenedAt() > 3000
+                        && !recording) {
+                    showStatus("UVC открыт, но кадры не поступают. Выберите YUYV и переподключите USB.");
+                }
+            }
+            ui.postDelayed(this, 900);
+        }
+    };
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
             if (!USB_ACTION.equals(intent.getAction())) return;
@@ -148,7 +167,7 @@ public final class MainActivity extends CameraActivity {
         cameraContainer = new FrameLayout(this);
         cameraContainer.setBackgroundColor(Color.BLACK);
         cameraView = new AspectRatioTextureView(this);
-        // CameraActivity will attach this view when it initializes.
+        // AUSBC attaches the native TextureView in CameraActivity.initView().
         root.addView(cameraContainer, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
@@ -159,8 +178,16 @@ public final class MainActivity extends CameraActivity {
         root.addView(status, slp);
         usbDetails = text("Поиск USB...", 11, 0xff8fa5b1);
         usbDetails.setOnClickListener(v -> showDiagnostics());
-        root.addView(usbDetails, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(27)));
+        LinearLayout formatRow = new LinearLayout(this);
+        formatRow.setGravity(Gravity.CENTER_VERTICAL);
+        formatRow.addView(usbDetails, new LinearLayout.LayoutParams(0, dp(34), 1));
+        videoModeButton = button("MJPEG", SURFACE);
+        videoModeButton.setTextSize(11);
+        formatRow.addView(videoModeButton,
+                new LinearLayout.LayoutParams(dp(93), dp(34)));
+        videoModeButton.setOnClickListener(v -> chooseVideoMode());
+        root.addView(formatRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(36)));
 
         LinearLayout audioRow = new LinearLayout(this);
         audioRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -203,6 +230,7 @@ public final class MainActivity extends CameraActivity {
         rotate.setOnClickListener(v -> {
             rotation = (rotation + 1) % 4;
             cameraView.setRotation(rotation * 90f);
+            if (previewOverlay != null) previewOverlay.setRotation(rotation * 90f);
         });
         return root;
     }
@@ -216,11 +244,16 @@ public final class MainActivity extends CameraActivity {
     }
 
     @Override protected CameraRequest getCameraRequest() {
+        int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0);
+        int width = mode == 2 || mode == 3 ? 320 : 640;
+        int height = mode == 2 || mode == 3 ? 240 : 480;
         return new CameraRequest.Builder()
-                .setPreviewWidth(640)
-                .setPreviewHeight(480)
+                .setPreviewWidth(width)
+                .setPreviewHeight(height)
                 .setRenderMode(CameraRequest.RenderMode.NORMAL)
-                .setPreviewFormat(CameraRequest.PreviewFormat.FORMAT_MJPEG)
+                .setPreviewFormat(mode == 1 || mode == 3
+                        ? CameraRequest.PreviewFormat.FORMAT_YUYV
+                        : CameraRequest.PreviewFormat.FORMAT_MJPEG)
                 .setAudioSource(micEnabled
                         ? CameraRequest.AudioSource.SOURCE_SYS_MIC
                         : CameraRequest.AudioSource.NONE)
@@ -241,6 +274,20 @@ public final class MainActivity extends CameraActivity {
     @Override protected void initData() {
         micButton.setText(micEnabled ? "Микрофон: ВКЛ" : "Микрофон: ВЫКЛ");
         registerOwnUsbReceiver();
+        updateVideoModeButton();
+        previewOverlay = new ImageView(this);
+        previewOverlay.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        previewOverlay.setVisibility(View.GONE);
+        cameraContainer.addView(previewOverlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        livePreview = new LivePreview(previewOverlay, result -> {
+            if (result == 1) {
+                addTrace("FIRST FRAME received");
+                showStatus("Видеокадры поступают • программный предпросмотр");
+            }
+        });
+        recordButton.setEnabled(false);
+        ui.post(previewTick);
         requestAppPermissions();
         ui.postDelayed(() -> retryUsb(false), 2200);
     }
@@ -282,26 +329,39 @@ public final class MainActivity extends CameraActivity {
             switch (state) {
                 case OPENED:
                     pendingMicChange = false;
-                    recordButton.setEnabled(true);
-                    addTrace("UVC OPENED: " + camera.getCameraRequest().getPreviewWidth() + "x" + camera.getCameraRequest().getPreviewHeight());
+                    recordButton.setEnabled(false);
+                    livePreview.reset();
+                    camera.addPreviewDataCallBack(livePreview);
+                    addTrace("UVC OPENED: " + camera.getCameraRequest().getPreviewWidth()
+                            + "x" + camera.getCameraRequest().getPreviewHeight()
+                            + " previewFormat=" + camera.getCameraRequest().getPreviewFormat());
+                    addTrace("UVC supported sizes: " + getAllPreviewSizes(null));
                     // Avoid native UVC button proxy until the JNI lifetime is verified.
                     setEncodeDataCallBack((type, data, offset, size, pts) -> {
                         if (type == IEncodeDataCallBack.DataType.AAC && recording)
                             meter.offerAac(data, offset, size);
                     });
                     cameraView.setRotation(rotation * 90f);
-                    showStatus("Видео открыто • " + camera.getCameraRequest().getPreviewWidth()
-                            + "×" + camera.getCameraRequest().getPreviewHeight());
+                    showStatus("UVC открыт • ожидаем первые видеокадры...");
+                    ui.postDelayed(() -> {
+                        if (isCameraOpened() && livePreview.getFrames() > 0 && !pendingMicChange)
+                            recordButton.setEnabled(true);
+                    }, 500);
                     updateUsbDetails();
                     break;
                 case CLOSED:
                     addTrace("UVC CLOSED");
+                    camera.removePreviewDataCallBack(livePreview);
+                    livePreview.reset();
+                    recordButton.setEnabled(false);
                     uvcButtonCallback = null;
                     if (recording) stopVideo();
                     showStatus("USB-камера отключена");
                     break;
                 case ERROR:
                     addTrace("UVC ERROR: " + message);
+                    recordButton.setEnabled(false);
+                    livePreview.reset();
                     if (recording) stopVideo();
                     showStatus("Ошибка USB: " + (message == null ? "неизвестно" : message));
                     updateUsbDetails();
@@ -314,10 +374,22 @@ public final class MainActivity extends CameraActivity {
     private ICaptureCallBack captureCallback(String kind) {
         return new ICaptureCallBack() {
             @Override public void onBegin() {
-                ui.post(() -> showStatus(kind + ": сохранение началось"));
+                ui.post(() -> {
+                    addTrace(kind + " onBegin");
+                    if (recording && "Видео".equals(kind)) {
+                        recordingActive = true;
+                        recordBeganAt = SystemClock.elapsedRealtime();
+                        startedAt = recordBeganAt;
+                        recordButton.setText("■ Стоп");
+                        recordButton.setEnabled(true);
+                        ui.post(timeTick);
+                    }
+                    showStatus(kind + ": сохранение началось");
+                });
             }
             @Override public void onError(String error) {
                 ui.post(() -> {
+                    addTrace(kind + " onError: " + error);
                     showStatus(kind + ": " + (error == null ? "ошибка" : error));
                     if (recording && "Видео".equals(kind)) finishRecordingUi();
                 });
@@ -341,6 +413,12 @@ public final class MainActivity extends CameraActivity {
     }
 
     private void startVideo() {
+        if (livePreview == null || livePreview.getFrames() < 3
+                || livePreview.getLastFrameAgeMs() > 2500) {
+            showStatus("Нет живых кадров. MP4 пока записывать нельзя.");
+            addTrace("Recording blocked: no recent decoded video frames");
+            return;
+        }
         if (pendingMicChange) {
             showStatus("Переподключите эндоскоп, чтобы применить режим микрофона");
             return;
@@ -356,16 +434,25 @@ public final class MainActivity extends CameraActivity {
             return;
         }
         recording = true;
+        recordingActive = false;
         startedAt = SystemClock.elapsedRealtime();
-        recordButton.setText("■ Стоп");
+        recordButton.setText("Подготовка...");
+        recordButton.setEnabled(false);
         recordButton.setBackgroundTintList(ColorStateList.valueOf(0xffa02f38));
         micButton.setEnabled(false);
         ui.removeCallbacks(timeTick);
-        ui.post(timeTick);
         meter.stopIdle();
         if (micEnabled) meter.startDecoder();
         try {
             captureVideoStart(captureCallback("Видео"), null, 0L);
+            ui.postDelayed(() -> {
+                if (recording && !recordingActive) {
+                    addTrace("Muxer did not report onBegin after 8s");
+                    showStatus("Нет запуска MP4. Проверьте диагностику; повторите с другим форматом.");
+                    // Do not call captureVideoStop: unstarted muxer throws
+                    // Can't stop due to wrong state(INITIALIZED).
+                }
+            }, 8000);
             showStatus(micEnabled ? "Запись видео + микрофон телефона" :
                     "Запись видео без звука");
         } catch (Exception ex) {
@@ -376,6 +463,10 @@ public final class MainActivity extends CameraActivity {
 
     private void stopVideo() {
         if (!recording) return;
+        if (!recordingActive) {
+            showStatus("MP4 ещё не начался: ждём видеокодек");
+            return;
+        }
         captureVideoStop();
         finishRecordingUi();
         showStatus("Сохраняем MP4...");
@@ -383,8 +474,11 @@ public final class MainActivity extends CameraActivity {
 
     private void finishRecordingUi() {
         recording = false;
+        recordingActive = false;
         ui.removeCallbacks(timeTick);
         recordButton.setText("● Запись");
+        recordButton.setEnabled(livePreview != null && livePreview.getFrames() > 0
+                && !pendingMicChange);
         recordButton.setBackgroundTintList(ColorStateList.valueOf(0xffb53d4a));
         micButton.setEnabled(true);
         meter.stopDecoder();
@@ -478,9 +572,14 @@ public final class MainActivity extends CameraActivity {
             usbDetails.setText("USB: камера 349C:0411 не найдена • нажмите для диагностики");
         } else {
             boolean permitted = manager != null && manager.hasPermission(device);
-            usbDetails.setText("USB 349C:0411 • доступ " +
-                (permitted ? "есть" : "нет") + " • UVC " +
-                (isCameraOpened() ? "OPEN" : "WAIT") + " • диагностика ↗");
+            usbDetails.setText("USB 349C:0411 • " +
+                (permitted ? "разрешено" : "нет доступа") + " • " +
+                (isCameraOpened() ? "OPEN" : "WAIT") +
+                " • кадров " + (livePreview == null ? 0 : livePreview.getFrames()) +
+                " • журнал ↗");
+            if (isCameraOpened() && livePreview != null && livePreview.getFrames() > 2
+                    && livePreview.getLastFrameAgeMs() < 2500
+                    && !recording && !pendingMicChange) recordButton.setEnabled(true);
         }
     }
 
@@ -497,7 +596,11 @@ public final class MainActivity extends CameraActivity {
                 " / API " + Build.VERSION.SDK_INT +
                 "\nUSB: " + (usbDetails == null ? "-" : usbDetails.getText()) +
                 "\nCamera: " + (isCameraOpened() ? "OPEN" : "WAIT") +
-                "\nMIC: " + micEnabled + "\n\nEvents:\n" + trace;
+                "\nMIC: " + micEnabled +
+                "\nMode: " + getVideoModeLabel() +
+                "\nFrames: " + (livePreview == null ? "-" : livePreview.getFrames()) +
+                "\nLast frame age (ms): " + (livePreview == null ? "-" : livePreview.getLastFrameAgeMs()) +
+                "\n\nEvents:\n" + trace;
         new AlertDialog.Builder(this)
                 .setTitle("Диагностика USB")
                 .setMessage(report)
@@ -512,6 +615,39 @@ public final class MainActivity extends CameraActivity {
                     }
                 })
                 .setNegativeButton("Закрыть", null).show();
+    }
+
+    private String getVideoModeLabel() {
+        switch (getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0)) {
+            case 1: return "YUYV 640×480";
+            case 2: return "MJPEG 320×240";
+            case 3: return "YUYV 320×240";
+            default: return "MJPEG 640×480";
+        }
+    }
+
+    private void updateVideoModeButton() {
+        if (videoModeButton != null) {
+            videoModeButton.setText(getSharedPreferences("settings", MODE_PRIVATE)
+                    .getInt("video_mode", 0) % 2 == 0 ? "MJPEG" : "YUYV");
+        }
+    }
+
+    private void chooseVideoMode() {
+        final String[] options = {"MJPEG 640×480", "YUYV 640×480",
+                "MJPEG 320×240", "YUYV 320×240"};
+        int selected = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0);
+        new AlertDialog.Builder(this)
+                .setTitle("Формат USB-видео")
+                .setSingleChoiceItems(options, selected, (dialog, which) -> {
+                    getSharedPreferences("settings", MODE_PRIVATE).edit()
+                            .putInt("video_mode", which).apply();
+                    updateVideoModeButton();
+                    addTrace("Selected video format: " + options[which]);
+                    showStatus("Для смены формата отключите и подключите эндоскоп снова.");
+                    dialog.dismiss();
+                })
+                .setNegativeButton("Отмена", null).show();
     }
 
     @Override protected void onResume() {
@@ -534,6 +670,7 @@ public final class MainActivity extends CameraActivity {
     @Override protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
         if (meter != null) meter.stopAll();
+        if (livePreview != null) livePreview.close();
         if (usbReceiverRegistered) {
             try { unregisterReceiver(usbPermissionReceiver); }
             catch (IllegalArgumentException ignored) { }
