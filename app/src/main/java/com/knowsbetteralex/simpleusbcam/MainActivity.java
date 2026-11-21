@@ -113,7 +113,9 @@ public final class MainActivity extends CameraActivity {
     private int requestedMaxHeight;
     private boolean usbConnectRequestPending;
     private long lastUsbConnectRequest;
-    private Runnable automaticUsbRetry;
+    private Runnable usbWatchdog;
+    private boolean usbFallbackUsed;
+    private boolean usbOpenError;
     private boolean recVisible;
     private final Runnable recBlink = new Runnable() {
         @Override public void run() {
@@ -128,31 +130,10 @@ public final class MainActivity extends CameraActivity {
             if (livePreview != null) {
                 calculateFps();
                 updateUsbDetails();
-                if (isCameraOpened() && !recording) {
-                    MultiCameraClient.ICamera activeCamera = getCurrentCamera();
-                    CameraRequest activeRequest = activeCamera == null ? null :
-                            activeCamera.getCameraRequest();
-                    if (maxResolutionUpgrade && livePreview.getFrames() > 0 &&
-                            activeRequest != null &&
-                            activeRequest.getPreviewWidth() == requestedMaxWidth &&
-                            activeRequest.getPreviewHeight() == requestedMaxHeight) {
-                        maxResolutionUpgrade = false;
-                        addTrace("Max YUYV working: " + requestedMaxWidth + "x"
-                                + requestedMaxHeight);
-                    }
-                    if (livePreview.getFrames() == 0) {
-                    long silence = SystemClock.elapsedRealtime() - livePreview.getOpenedAt();
-                    if (maxResolutionUpgrade && !maxResolutionFallback &&
-                            silence > 5500) {
-                        maxResolutionFallback = true;
-                        maxResolutionUpgrade = false;
-                        addTrace("No frames at max YUYV; recovering to 640x480");
-                        showStatus("Максимальное YUYV не работает: возвращаем 640×480...");
-                        getCurrentCamera().updateResolution(640, 480);
-                    } else if (silence > 3000) {
-                        showStatus("UVC открыт, кадры ещё не поступают...");
-                    }
-                    }
+                if (isCameraOpened() && livePreview.getFrames() == 0 &&
+                        !recording &&
+                        SystemClock.elapsedRealtime() - livePreview.getOpenedAt() > 4000) {
+                    showStatus("USB открыт, но нет кадров. Проверьте YUYV и разрешение.");
                 }
             }
             ui.postDelayed(this, 900);
@@ -165,10 +146,11 @@ public final class MainActivity extends CameraActivity {
                 UsbDevice attached = intentDevice(intent);
                 if (isOurEndoscope(attached)) {
                     addTrace("USB ATTACHED broadcast: " + attached.getDeviceName());
-                    maxResolutionAttempted = false;
+                    usbOpenError = false;
+                    usbFallbackUsed = false;
+                    lastUsbConnectRequest = 0;
                     maxResolutionUpgrade = false;
-                    maxResolutionFallback = false;
-                    scheduleAutoUsbConnect("USB attach", 900);
+                    scheduleUsbWatchdog("USB attached", 7000);
                 }
                 return;
             }
@@ -176,10 +158,10 @@ public final class MainActivity extends CameraActivity {
                 UsbDevice detached = intentDevice(intent);
                 if (isOurEndoscope(detached)) {
                     addTrace("USB DETACHED broadcast");
-                    cancelAutoUsbConnect();
-                    maxResolutionAttempted = false;
+                    cancelUsbWatchdog();
+                    usbFallbackUsed = false;
+                    usbOpenError = false;
                     maxResolutionUpgrade = false;
-                    maxResolutionFallback = false;
                     usbPermissionPending = false;
                     updateUsbDetails();
                 }
@@ -193,7 +175,9 @@ public final class MainActivity extends CameraActivity {
             addTrace("USB permission callback: " + (granted ? "GRANTED" : "DENIED"));
             if (granted) {
                 showStatus("USB-разрешение получено, открываем видеопоток...");
-                scheduleAutoUsbConnect("permission granted", 650);
+                // Android granted access. Let AUSBC's USB monitor complete its
+                // own connection first; do not open a second UVC handle.
+                scheduleUsbWatchdog("USB permission granted", 4000);
             } else showStatus("Доступ к USB не предоставлен; нажмите USB");
             updateUsbDetails();
         }
@@ -355,6 +339,16 @@ public final class MainActivity extends CameraActivity {
         int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1);
         int width = mode == 2 || mode == 3 ? 320 : 640;
         int height = mode == 2 || mode == 3 ? 240 : 480;
+        // The first successful 640x480 session discovers the supported YUYV
+        // sizes. On the NEXT physical connection use the largest advertised
+        // mode from the beginning, without tearing down the live native camera.
+        if (mode == 1 && !getSharedPreferences("settings", MODE_PRIVATE)
+                .getBoolean("yuyv_force_safe", false)) {
+            width = getSharedPreferences("settings", MODE_PRIVATE)
+                    .getInt("yuyv_max_width", 640);
+            height = getSharedPreferences("settings", MODE_PRIVATE)
+                    .getInt("yuyv_max_height", 480);
+        }
         return new CameraRequest.Builder()
                 .setPreviewWidth(width)
                 .setPreviewHeight(height)
@@ -402,7 +396,9 @@ public final class MainActivity extends CameraActivity {
         recordButton.setEnabled(false);
         ui.post(previewTick);
         requestAppPermissions();
-        scheduleAutoUsbConnect("activity started", 1800);
+        // AUSBC enumerates the camera automatically when its TextureView is
+        // ready. Only a single delayed watchdog may request a fallback.
+        scheduleUsbWatchdog("activity started", 7000);
     }
 
     private void requestAppPermissions() {
@@ -432,7 +428,7 @@ public final class MainActivity extends CameraActivity {
                 != PackageManager.PERMISSION_GRANTED) {
             showStatus("Разрешите доступ к камере Android");
         } else {
-            ui.postDelayed(() -> retryUsb(false), 600);
+            scheduleUsbWatchdog("camera permission granted", 6500);
         }
         if (micEnabled && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED && foreground)
@@ -445,8 +441,10 @@ public final class MainActivity extends CameraActivity {
         runOnUiThread(() -> {
             switch (state) {
                 case OPENED:
+                    usbOpenError = false;
+                    usbFallbackUsed = true;
                     usbConnectRequestPending = false;
-                    cancelAutoUsbConnect();
+                    cancelUsbWatchdog();
                     pendingMicChange = false;
                     recordButton.setEnabled(false);
                     AusbcVideoFix.Result encoderFix = AusbcVideoFix.apply(camera);
@@ -464,7 +462,7 @@ public final class MainActivity extends CameraActivity {
                             + "x" + camera.getCameraRequest().getPreviewHeight()
                             + " previewFormat=" + camera.getCameraRequest().getPreviewFormat());
                     addTrace("UVC supported sizes: " + getAllPreviewSizes(null));
-                    selectMaximumYuyvResolution(camera);
+                    rememberMaximumYuyvResolution(camera);
                     // Avoid native UVC button proxy until the JNI lifetime is verified.
                     setEncodeDataCallBack((type, data, offset, size, pts) -> {
                         if (type == IEncodeDataCallBack.DataType.AAC && recording)
@@ -495,14 +493,22 @@ public final class MainActivity extends CameraActivity {
                     break;
                 case ERROR:
                     usbConnectRequestPending = false;
+                    usbOpenError = true;
+                    cancelUsbWatchdog();
                     videoEncoderOk = false;
-                    // An unavailable maximum UVC resolution must never cause an
-                    // infinite close/reopen loop.
-                    if (maxResolutionUpgrade && !maxResolutionFallback) {
-                        maxResolutionFallback = true;
-                        maxResolutionUpgrade = false;
-                        addTrace("Max YUYV failed: fallback to 640x480");
-                        ui.postDelayed(() -> camera.updateResolution(640, 480), 1200);
+                    // A mode learned from a previous connection may be too
+                    // demanding. For the NEXT physical connection fall back
+                    // to the proven 640x480 without reopening the native handle
+                    // from inside this error callback.
+                    CameraRequest failingRequest = camera.getCameraRequest();
+                    if (failingRequest != null &&
+                            getSharedPreferences("settings", MODE_PRIVATE)
+                                    .getInt("video_mode", 1) == 1 &&
+                            (failingRequest.getPreviewWidth() > 640 ||
+                             failingRequest.getPreviewHeight() > 480)) {
+                        getSharedPreferences("settings", MODE_PRIVATE).edit()
+                                .putBoolean("yuyv_force_safe", true).apply();
+                        addTrace("YUYV high resolution failed; next plug uses 640x480");
                     }
                     addTrace("UVC ERROR: " + message);
                     recordButton.setEnabled(false);
@@ -699,7 +705,7 @@ public final class MainActivity extends CameraActivity {
     private void retryUsb(boolean userAction) {
         updateUsbDetails();
         if (isCameraOpened()) {
-            showStatus("Видеопоток открыт. Если экран чёрный — переподключите кабель.");
+            showStatus("Видеопоток открыт.");
             return;
         }
         UsbDevice device = getDefaultCamera();
@@ -719,7 +725,8 @@ public final class MainActivity extends CameraActivity {
             // Avoid reopening an active camera repeatedly; AUSBC's USBMonitor
             // closes its control block when requestPermission() is called.
             long now = SystemClock.elapsedRealtime();
-            if (!userAction && now - lastUsbConnectRequest < 4200) return;
+            if (!userAction && (usbConnectRequestPending ||
+                    now - lastUsbConnectRequest < 4200)) return;
             lastUsbConnectRequest = now;
             usbConnectRequestPending = true;
             showStatus("USB разрешён — запрашиваем видеопоток...");
@@ -756,62 +763,62 @@ public final class MainActivity extends CameraActivity {
                 && device.getProductId() == ENDO_PID;
     }
 
-    private void cancelAutoUsbConnect() {
-        if (automaticUsbRetry != null) ui.removeCallbacks(automaticUsbRetry);
-        automaticUsbRetry = null;
+    private void cancelUsbWatchdog() {
+        if (usbWatchdog != null) ui.removeCallbacks(usbWatchdog);
+        usbWatchdog = null;
     }
 
-    private void scheduleAutoUsbConnect(String reason, long delayMs) {
-        cancelAutoUsbConnect();
-        automaticUsbRetry = () -> {
-            automaticUsbRetry = null;
-            if (!foreground || isCameraOpened() || getDefaultCamera() == null) return;
-            addTrace("Automatic USB connection: " + reason);
-            retryUsb(false);
-            // A delayed attach event may precede AUSBC's own monitor
-            // registration. Allow one non-aggressive retry after its poll.
-            if (!isCameraOpened() && !usbPermissionPending) {
-                ui.postDelayed(() -> {
-                    if (foreground && !isCameraOpened()
-                            && getDefaultCamera() != null) retryUsb(false);
-                }, 4500);
+    private void scheduleUsbWatchdog(String reason, long delayMs) {
+        cancelUsbWatchdog();
+        usbWatchdog = () -> {
+            usbWatchdog = null;
+            if (!foreground || usbOpenError || isCameraOpened() ||
+                    getDefaultCamera() == null) return;
+            UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+            UsbDevice device = getDefaultCamera();
+            if (manager == null || device == null || usbPermissionPending) return;
+            if (manager.hasPermission(device)) {
+                if (usbFallbackUsed) return;
+                usbFallbackUsed = true;
+                addTrace("One-time USBMonitor fallback: " + reason);
+                retryUsb(false);
+            } else {
+                // Android 14/15 USB permission sometimes needs a mutable
+                // PendingIntent. Request it once; do not open a UVC handle
+                // until the permission broadcast arrives.
+                addTrace("USB access not granted after AUSBC discovery");
+                retryUsb(false);
             }
         };
-        ui.postDelayed(automaticUsbRetry, delayMs);
+        ui.postDelayed(usbWatchdog, delayMs);
     }
 
-    private void selectMaximumYuyvResolution(MultiCameraClient.ICamera camera) {
-        int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1);
-        if (mode != 1 || maxResolutionAttempted) return;
-        maxResolutionAttempted = true;
+    private void rememberMaximumYuyvResolution(MultiCameraClient.ICamera camera) {
+        int mode = getSharedPreferences("settings", MODE_PRIVATE)
+                .getInt("video_mode", 1);
+        if (mode != 1) return;
         java.util.List<PreviewSize> sizes = camera.getAllPreviewSizes(null);
         if (sizes == null || sizes.isEmpty()) return;
         PreviewSize largest = null;
         for (PreviewSize size : sizes) {
             if (size.getWidth() <= 0 || size.getHeight() <= 0) continue;
-            if (largest == null || (long) size.getWidth() * size.getHeight()
-                    > (long) largest.getWidth() * largest.getHeight()) largest = size;
+            if (largest == null ||
+                (long) size.getWidth() * size.getHeight() >
+                (long) largest.getWidth() * largest.getHeight()) {
+                largest = size;
+            }
         }
         if (largest == null) return;
-        CameraRequest request = camera.getCameraRequest();
-        if (request == null) return;
-        addTrace("Largest supported YUYV: " + largest.getWidth() + "x"
-                + largest.getHeight() + ", opened " + request.getPreviewWidth()
-                + "x" + request.getPreviewHeight());
-        if (largest.getWidth() == request.getPreviewWidth()
-                && largest.getHeight() == request.getPreviewHeight()) return;
-        final int targetWidth = largest.getWidth();
-        final int targetHeight = largest.getHeight();
-        requestedMaxWidth = targetWidth;
-        requestedMaxHeight = targetHeight;
-        maxResolutionUpgrade = true;
-        showStatus("Выбираем максимальное YUYV: " + targetWidth + "×" + targetHeight);
-        ui.postDelayed(() -> {
-            if (foreground && !recording && isCameraOpened()) {
-                addTrace("YUYV auto updateResolution: " + targetWidth + "x" + targetHeight);
-                camera.updateResolution(targetWidth, targetHeight);
-            }
-        }, 550);
+        addTrace("Largest advertised YUYV: " + largest.getWidth() + "x" +
+                largest.getHeight() + "; active: " +
+                camera.getCameraRequest().getPreviewWidth() + "x" +
+                camera.getCameraRequest().getPreviewHeight());
+        getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .putInt("yuyv_max_width", largest.getWidth())
+                .putInt("yuyv_max_height", largest.getHeight())
+                .apply();
+        // No updateResolution here: AUSBC closes/reopens the native UVC
+        // handle, which previously caused result=-99 on this endoscope.
     }
 
     private void startRecordBlink() {
@@ -878,7 +885,9 @@ public final class MainActivity extends CameraActivity {
             UsbDevice device = intentDevice(intent);
             if (isOurEndoscope(device)) {
                 addTrace("USB attachment opened the app");
-                scheduleAutoUsbConnect("USB auto-open", 1150);
+                usbFallbackUsed = false;
+                usbOpenError = false;
+                scheduleUsbWatchdog("USB auto-open", 7000);
             }
         }
     }
@@ -1006,7 +1015,8 @@ public final class MainActivity extends CameraActivity {
                 .setTitle("Формат USB-видео")
                 .setSingleChoiceItems(options, selected, (dialog, which) -> {
                     getSharedPreferences("settings", MODE_PRIVATE).edit()
-                            .putInt("video_mode", which).apply();
+                            .putInt("video_mode", which)
+                            .putBoolean("yuyv_force_safe", false).apply();
                     updateVideoModeButton();
                     addTrace("Selected video format: " + options[which]);
                     showStatus("Для смены формата отключите и подключите эндоскоп снова.");
@@ -1018,7 +1028,7 @@ public final class MainActivity extends CameraActivity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
-        scheduleAutoUsbConnect("activity resumed", 1450);
+        scheduleUsbWatchdog("activity resumed", 7000);
         updateUsbDetails();
         if (meter != null && micEnabled && !recording &&
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO)
@@ -1028,7 +1038,7 @@ public final class MainActivity extends CameraActivity {
 
     @Override protected void onPause() {
         foreground = false;
-        cancelAutoUsbConnect();
+        cancelUsbWatchdog();
         stopRecordBlink();
         if (recording) stopVideo();
         if (meter != null) meter.stopAll();
@@ -1036,7 +1046,7 @@ public final class MainActivity extends CameraActivity {
     }
 
     @Override protected void onDestroy() {
-        cancelAutoUsbConnect();
+        cancelUsbWatchdog();
         ui.removeCallbacksAndMessages(null);
         if (meter != null) meter.stopAll();
         if (livePreview != null) livePreview.close();
