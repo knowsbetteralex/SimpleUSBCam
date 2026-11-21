@@ -127,9 +127,18 @@ public final class MainActivity extends CameraActivity {
                 calculateFps();
                 updateUsbDetails();
                 if (isCameraOpened() && livePreview.getFrames() == 0
-                        && SystemClock.elapsedRealtime() - livePreview.getOpenedAt() > 3000
                         && !recording) {
-                    showStatus("UVC открыт, но кадры не поступают. Выберите YUYV и переподключите USB.");
+                    long silence = SystemClock.elapsedRealtime() - livePreview.getOpenedAt();
+                    if (maxResolutionUpgrade && !maxResolutionFallback &&
+                            silence > 5500) {
+                        maxResolutionFallback = true;
+                        maxResolutionUpgrade = false;
+                        addTrace("No frames at max YUYV; recovering to 640x480");
+                        showStatus("Максимальное YUYV не работает: возвращаем 640×480...");
+                        getCurrentCamera().updateResolution(640, 480);
+                    } else if (silence > 3000) {
+                        showStatus("UVC открыт, кадры ещё не поступают...");
+                    }
                 }
             }
             ui.postDelayed(this, 900);
@@ -422,6 +431,8 @@ public final class MainActivity extends CameraActivity {
         runOnUiThread(() -> {
             switch (state) {
                 case OPENED:
+                    usbConnectRequestPending = false;
+                    cancelAutoUsbConnect();
                     pendingMicChange = false;
                     recordButton.setEnabled(false);
                     AusbcVideoFix.Result encoderFix = AusbcVideoFix.apply(camera);
@@ -457,6 +468,7 @@ public final class MainActivity extends CameraActivity {
                     updateUsbDetails();
                     break;
                 case CLOSED:
+                    usbConnectRequestPending = false;
                     videoEncoderOk = false;
                     addTrace("UVC CLOSED");
                     camera.removePreviewDataCallBack(livePreview);
@@ -467,6 +479,7 @@ public final class MainActivity extends CameraActivity {
                     showStatus("USB-камера отключена");
                     break;
                 case ERROR:
+                    usbConnectRequestPending = false;
                     videoEncoderOk = false;
                     // An unavailable maximum UVC resolution must never cause an
                     // infinite close/reopen loop.
@@ -688,6 +701,7 @@ public final class MainActivity extends CameraActivity {
             long now = SystemClock.elapsedRealtime();
             if (!userAction && now - lastUsbConnectRequest < 4200) return;
             lastUsbConnectRequest = now;
+            usbConnectRequestPending = true;
             showStatus("USB разрешён — запрашиваем видеопоток...");
             addTrace((userAction ? "Manual" : "Auto") + " USB connect requested");
             requestPermission(device);
@@ -796,7 +810,6 @@ public final class MainActivity extends CameraActivity {
         boolean landscape = orientation == Configuration.ORIENTATION_LANDSCAPE;
         contentLayout.setOrientation(landscape
                 ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        contentLayout.setWeightSum(0);
         // Keep cameraContainer attached to the same parent so Android does not
         // destroy the TextureView and interrupt recording during rotation.
         cameraContainer.setLayoutParams(landscape
