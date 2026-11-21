@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
@@ -25,6 +26,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.ImageView;
 import com.jiangdg.ausbc.callback.IPreviewDataCallBack;
 import android.widget.ProgressBar;
@@ -38,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import com.jiangdg.ausbc.MultiCameraClient;
 import com.jiangdg.ausbc.base.CameraActivity;
 import com.jiangdg.ausbc.camera.bean.CameraRequest;
+import com.jiangdg.ausbc.camera.bean.PreviewSize;
 import com.jiangdg.ausbc.callback.ICameraStateCallBack;
 import com.jiangdg.ausbc.callback.ICaptureCallBack;
 import com.jiangdg.ausbc.callback.IEncodeDataCallBack;
@@ -63,6 +66,14 @@ public final class MainActivity extends CameraActivity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private FrameLayout cameraContainer;
+    private LinearLayout rootLayout;
+    private LinearLayout contentLayout;
+    private ScrollView sidebarScroll;
+    private LinearLayout sidebarLayout;
+    private LinearLayout controlsLayout;
+    private Button[] actionButtons;
+    private float[] actionWeights = {1.0f, 1.25f, 1.5f, 1.0f};
+    private TextView recIndicator;
     private AspectRatioTextureView cameraView;
     private ProgressBar meterBar;
     private TextView meterLabel;
@@ -95,6 +106,21 @@ public final class MainActivity extends CameraActivity {
     private long recordBeganAt;
     private boolean recordingActive;
     private boolean videoEncoderOk;
+    private boolean maxResolutionAttempted;
+    private boolean maxResolutionUpgrade;
+    private boolean maxResolutionFallback;
+    private boolean usbConnectRequestPending;
+    private long lastUsbConnectRequest;
+    private Runnable automaticUsbRetry;
+    private boolean recVisible;
+    private final Runnable recBlink = new Runnable() {
+        @Override public void run() {
+            if (!recordingActive || recIndicator == null) return;
+            recVisible = !recVisible;
+            recIndicator.setVisibility(recVisible ? View.VISIBLE : View.INVISIBLE);
+            ui.postDelayed(this, 500);
+        }
+    };
     private final Runnable previewTick = new Runnable() {
         @Override public void run() {
             if (livePreview != null) {
@@ -111,20 +137,40 @@ public final class MainActivity extends CameraActivity {
     };
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            if (!USB_ACTION.equals(intent.getAction())) return;
-            UsbDevice device;
-            if (Build.VERSION.SDK_INT >= 33) {
-                device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
-            } else {
-                device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            String action = intent.getAction();
+            if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+                UsbDevice attached = intentDevice(intent);
+                if (isOurEndoscope(attached)) {
+                    addTrace("USB ATTACHED broadcast: " + attached.getDeviceName());
+                    maxResolutionAttempted = false;
+                    maxResolutionUpgrade = false;
+                    maxResolutionFallback = false;
+                    scheduleAutoUsbConnect("USB attach", 900);
+                }
+                return;
             }
+            if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+                UsbDevice detached = intentDevice(intent);
+                if (isOurEndoscope(detached)) {
+                    addTrace("USB DETACHED broadcast");
+                    cancelAutoUsbConnect();
+                    maxResolutionAttempted = false;
+                    maxResolutionUpgrade = false;
+                    maxResolutionFallback = false;
+                    usbPermissionPending = false;
+                    updateUsbDetails();
+                }
+                return;
+            }
+            if (!USB_ACTION.equals(action)) return;
+            UsbDevice device = intentDevice(intent);
             usbPermissionPending = false;
             boolean granted = device != null && intent.getBooleanExtra(
                     UsbManager.EXTRA_PERMISSION_GRANTED, false);
             addTrace("USB permission callback: " + (granted ? "GRANTED" : "DENIED"));
             if (granted) {
                 showStatus("USB-разрешение получено, открываем видеопоток...");
-                ui.postDelayed(() -> requestPermission(device), 350);
+                scheduleAutoUsbConnect("permission granted", 650);
             } else showStatus("Доступ к USB не предоставлен; нажмите USB");
             updateUsbDetails();
         }
@@ -154,6 +200,7 @@ public final class MainActivity extends CameraActivity {
         });
 
         LinearLayout root = new LinearLayout(this);
+        rootLayout = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
         root.setPadding(dp(12), dp(8), dp(12), dp(9));
@@ -165,6 +212,13 @@ public final class MainActivity extends CameraActivity {
         header.addView(title, new LinearLayout.LayoutParams(0, dp(38), 1));
         timeLabel = text("00:00", 16, GREEN);
         header.addView(timeLabel);
+        recIndicator = text("● REC", 13, 0xffff4a5e);
+        recIndicator.setTypeface(null, android.graphics.Typeface.BOLD);
+        recIndicator.setVisibility(View.INVISIBLE);
+        LinearLayout.LayoutParams recLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(37));
+        recLp.setMargins(dp(10), 0, dp(10), 0);
+        header.addView(recIndicator, recLp);
         Button usbButton = button("USB", SURFACE);
         header.addView(usbButton, new LinearLayout.LayoutParams(dp(62), dp(37)));
         usbButton.setOnClickListener(v -> {
@@ -173,18 +227,33 @@ public final class MainActivity extends CameraActivity {
         });
         root.addView(header);
 
+        contentLayout = new LinearLayout(this);
+        contentLayout.setOrientation(LinearLayout.VERTICAL);
+        root.addView(contentLayout, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        sidebarScroll = new ScrollView(this);
+        sidebarScroll.setFillViewport(false);
+        sidebarScroll.setVerticalScrollBarEnabled(false);
+        sidebarLayout = new LinearLayout(this);
+        sidebarLayout.setOrientation(LinearLayout.VERTICAL);
+        sidebarScroll.addView(sidebarLayout,
+                new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
         cameraContainer = new FrameLayout(this);
         cameraContainer.setBackgroundColor(Color.BLACK);
         cameraView = new AspectRatioTextureView(this);
         // AUSBC attaches the native TextureView in CameraActivity.initView().
-        root.addView(cameraContainer, new LinearLayout.LayoutParams(
+        contentLayout.addView(cameraContainer, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        contentLayout.addView(sidebarScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         status = text("Подключите USB-эндоскоп", 13, 0xffa3b2bc);
         status.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(30));
-        root.addView(status, slp);
+        sidebarLayout.addView(status, slp);
         usbDetails = text("Поиск USB...", 11, 0xff8fa5b1);
         usbDetails.setOnClickListener(v -> showDiagnostics());
         LinearLayout formatRow = new LinearLayout(this);
@@ -200,7 +269,7 @@ public final class MainActivity extends CameraActivity {
         formatRow.addView(previewModeButton,
                 new LinearLayout.LayoutParams(dp(65), dp(34)));
         previewModeButton.setOnClickListener(v -> togglePreviewMode());
-        root.addView(formatRow, new LinearLayout.LayoutParams(
+        sidebarLayout.addView(formatRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(36)));
 
         LinearLayout audioRow = new LinearLayout(this);
@@ -220,21 +289,23 @@ public final class MainActivity extends CameraActivity {
         meterLabel = text("0 %", 12, WHITE);
         meterLabel.setMinWidth(dp(57));
         audioRow.addView(meterLabel);
-        root.addView(audioRow, new LinearLayout.LayoutParams(
+        sidebarLayout.addView(audioRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(31)));
 
         LinearLayout controls = new LinearLayout(this);
+        controlsLayout = controls;
         controls.setGravity(Gravity.CENTER);
         Button photo = button("Фото", SURFACE);
         recordButton = button("● Запись", 0xffb53d4a);
         micButton = button("Микрофон: ВКЛ", SURFACE);
         Button rotate = button("↻ 90°", SURFACE);
-        addButton(controls, photo, 1.0f);
-        addButton(controls, recordButton, 1.25f);
-        addButton(controls, micButton, 1.5f);
-        addButton(controls, rotate, 1.0f);
-        root.addView(controls, new LinearLayout.LayoutParams(
+        actionButtons = new Button[]{photo, recordButton, micButton, rotate};
+        for (int i = 0; i < actionButtons.length; i++) {
+            addButton(controls, actionButtons[i], actionWeights[i]);
+        }
+        sidebarLayout.addView(controls, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(55)));
+        applyOrientation(getResources().getConfiguration().orientation);
 
         photo.setOnClickListener(v -> takePhoto());
         recordButton.setOnClickListener(v -> {
@@ -258,7 +329,7 @@ public final class MainActivity extends CameraActivity {
     }
 
     @Override protected CameraRequest getCameraRequest() {
-        int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0);
+        int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1);
         int width = mode == 2 || mode == 3 ? 320 : 640;
         int height = mode == 2 || mode == 3 ? 240 : 480;
         return new CameraRequest.Builder()
@@ -308,7 +379,7 @@ public final class MainActivity extends CameraActivity {
         recordButton.setEnabled(false);
         ui.post(previewTick);
         requestAppPermissions();
-        ui.postDelayed(() -> retryUsb(false), 2200);
+        scheduleAutoUsbConnect("activity started", 1800);
     }
 
     private void requestAppPermissions() {
@@ -368,6 +439,7 @@ public final class MainActivity extends CameraActivity {
                             + "x" + camera.getCameraRequest().getPreviewHeight()
                             + " previewFormat=" + camera.getCameraRequest().getPreviewFormat());
                     addTrace("UVC supported sizes: " + getAllPreviewSizes(null));
+                    selectMaximumYuyvResolution(camera);
                     // Avoid native UVC button proxy until the JNI lifetime is verified.
                     setEncodeDataCallBack((type, data, offset, size, pts) -> {
                         if (type == IEncodeDataCallBack.DataType.AAC && recording)
@@ -396,6 +468,14 @@ public final class MainActivity extends CameraActivity {
                     break;
                 case ERROR:
                     videoEncoderOk = false;
+                    // An unavailable maximum UVC resolution must never cause an
+                    // infinite close/reopen loop.
+                    if (maxResolutionUpgrade && !maxResolutionFallback) {
+                        maxResolutionFallback = true;
+                        maxResolutionUpgrade = false;
+                        addTrace("Max YUYV failed: fallback to 640x480");
+                        ui.postDelayed(() -> camera.updateResolution(640, 480), 1200);
+                    }
                     addTrace("UVC ERROR: " + message);
                     recordButton.setEnabled(false);
                     livePreview.reset();
@@ -416,6 +496,7 @@ public final class MainActivity extends CameraActivity {
                     addTrace(kind + " onBegin");
                     if (recording && "Видео".equals(kind)) {
                         recordingActive = true;
+                        startRecordBlink();
                         recordBeganAt = SystemClock.elapsedRealtime();
                         startedAt = recordBeganAt;
                         recordButton.setText("■ Стоп");
@@ -531,6 +612,7 @@ public final class MainActivity extends CameraActivity {
     private void finishRecordingUi() {
         recording = false;
         recordingActive = false;
+        stopRecordBlink();
         ui.removeCallbacks(timeTick);
         recordButton.setText("● Запись");
         recordButton.setEnabled(videoEncoderOk && livePreview != null
@@ -573,6 +655,8 @@ public final class MainActivity extends CameraActivity {
     private void registerOwnUsbReceiver() {
         if (usbReceiverRegistered) return;
         IntentFilter filter = new IntentFilter(USB_ACTION);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         if (Build.VERSION.SDK_INT >= 33)
             registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(usbPermissionReceiver, filter);
@@ -599,8 +683,13 @@ public final class MainActivity extends CameraActivity {
             return;
         }
         if (manager.hasPermission(device)) {
+            // Avoid reopening an active camera repeatedly; AUSBC's USBMonitor
+            // closes its control block when requestPermission() is called.
+            long now = SystemClock.elapsedRealtime();
+            if (!userAction && now - lastUsbConnectRequest < 4200) return;
+            lastUsbConnectRequest = now;
             showStatus("USB разрешён — запрашиваем видеопоток...");
-            addTrace("USB granted; AUSBC connect requested");
+            addTrace((userAction ? "Manual" : "Auto") + " USB connect requested");
             requestPermission(device);
         } else if (!usbPermissionPending) {
             try {
@@ -616,6 +705,145 @@ public final class MainActivity extends CameraActivity {
                 usbPermissionPending = false;
                 addTrace("USB permission request failed: " + e);
                 showStatus("Ошибка разрешения USB: " + e.getMessage());
+            }
+        }
+    }
+
+    private UsbDevice intentDevice(Intent intent) {
+        if (intent == null) return null;
+        if (Build.VERSION.SDK_INT >= 33) {
+            return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+        }
+        return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+    }
+
+    private boolean isOurEndoscope(UsbDevice device) {
+        return device != null && device.getVendorId() == ENDO_VID
+                && device.getProductId() == ENDO_PID;
+    }
+
+    private void cancelAutoUsbConnect() {
+        if (automaticUsbRetry != null) ui.removeCallbacks(automaticUsbRetry);
+        automaticUsbRetry = null;
+    }
+
+    private void scheduleAutoUsbConnect(String reason, long delayMs) {
+        cancelAutoUsbConnect();
+        automaticUsbRetry = () -> {
+            automaticUsbRetry = null;
+            if (!foreground || isCameraOpened() || getDefaultCamera() == null) return;
+            addTrace("Automatic USB connection: " + reason);
+            retryUsb(false);
+            // A delayed attach event may precede AUSBC's own monitor
+            // registration. Allow one non-aggressive retry after its poll.
+            if (!isCameraOpened() && !usbPermissionPending) {
+                ui.postDelayed(() -> {
+                    if (foreground && !isCameraOpened()
+                            && getDefaultCamera() != null) retryUsb(false);
+                }, 4500);
+            }
+        };
+        ui.postDelayed(automaticUsbRetry, delayMs);
+    }
+
+    private void selectMaximumYuyvResolution(MultiCameraClient.ICamera camera) {
+        int mode = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1);
+        if (mode != 1 || maxResolutionAttempted) return;
+        maxResolutionAttempted = true;
+        java.util.List<PreviewSize> sizes = camera.getAllPreviewSizes(null);
+        if (sizes == null || sizes.isEmpty()) return;
+        PreviewSize largest = null;
+        for (PreviewSize size : sizes) {
+            if (size.getWidth() <= 0 || size.getHeight() <= 0) continue;
+            if (largest == null || (long) size.getWidth() * size.getHeight()
+                    > (long) largest.getWidth() * largest.getHeight()) largest = size;
+        }
+        if (largest == null) return;
+        CameraRequest request = camera.getCameraRequest();
+        if (request == null) return;
+        addTrace("Largest supported YUYV: " + largest.getWidth() + "x"
+                + largest.getHeight() + ", opened " + request.getPreviewWidth()
+                + "x" + request.getPreviewHeight());
+        if (largest.getWidth() == request.getPreviewWidth()
+                && largest.getHeight() == request.getPreviewHeight()) return;
+        final int targetWidth = largest.getWidth();
+        final int targetHeight = largest.getHeight();
+        maxResolutionUpgrade = true;
+        showStatus("Выбираем максимальное YUYV: " + targetWidth + "×" + targetHeight);
+        ui.postDelayed(() -> {
+            if (foreground && !recording && isCameraOpened()) {
+                addTrace("YUYV auto updateResolution: " + targetWidth + "x" + targetHeight);
+                camera.updateResolution(targetWidth, targetHeight);
+            }
+        }, 550);
+    }
+
+    private void startRecordBlink() {
+        stopRecordBlink();
+        recVisible = true;
+        if (recIndicator != null) recIndicator.setVisibility(View.VISIBLE);
+        ui.postDelayed(recBlink, 500);
+    }
+
+    private void stopRecordBlink() {
+        ui.removeCallbacks(recBlink);
+        recVisible = false;
+        if (recIndicator != null) recIndicator.setVisibility(View.INVISIBLE);
+    }
+
+    private void applyOrientation(int orientation) {
+        if (contentLayout == null || controlsLayout == null) return;
+        boolean landscape = orientation == Configuration.ORIENTATION_LANDSCAPE;
+        contentLayout.setOrientation(landscape
+                ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        contentLayout.setWeightSum(0);
+        // Keep cameraContainer attached to the same parent so Android does not
+        // destroy the TextureView and interrupt recording during rotation.
+        cameraContainer.setLayoutParams(landscape
+                ? new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        sidebarScroll.setLayoutParams(landscape
+                ? new LinearLayout.LayoutParams(dp(246),
+                        ViewGroup.LayoutParams.MATCH_PARENT)
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+        controlsLayout.setOrientation(landscape
+                ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        controlsLayout.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                landscape ? ViewGroup.LayoutParams.WRAP_CONTENT : dp(55)));
+        if (actionButtons != null) {
+            for (int i = 0; i < actionButtons.length; i++) {
+                LinearLayout.LayoutParams params;
+                if (landscape) {
+                    params = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+                    params.setMargins(dp(3), dp(1), dp(3), dp(1));
+                } else {
+                    params = new LinearLayout.LayoutParams(0, dp(48), actionWeights[i]);
+                    params.setMargins(dp(2), 0, dp(2), 0);
+                }
+                actionButtons[i].setLayoutParams(params);
+            }
+        }
+    }
+
+    @Override public void onConfigurationChanged(Configuration config) {
+        super.onConfigurationChanged(config);
+        applyOrientation(config.orientation);
+        addTrace("Device orientation changed: " +
+                (config.orientation == Configuration.ORIENTATION_LANDSCAPE
+                        ? "landscape" : "portrait"));
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+            UsbDevice device = intentDevice(intent);
+            if (isOurEndoscope(device)) {
+                addTrace("USB attachment opened the app");
+                scheduleAutoUsbConnect("USB auto-open", 1150);
             }
         }
     }
@@ -719,8 +947,8 @@ public final class MainActivity extends CameraActivity {
     }
 
     private String getVideoModeLabel() {
-        switch (getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0)) {
-            case 1: return "YUYV 640×480";
+        switch (getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1)) {
+            case 1: return "YUYV авто (макс.)";
             case 2: return "MJPEG 320×240";
             case 3: return "YUYV 320×240";
             default: return "MJPEG 640×480";
@@ -730,14 +958,14 @@ public final class MainActivity extends CameraActivity {
     private void updateVideoModeButton() {
         if (videoModeButton != null) {
             videoModeButton.setText(getSharedPreferences("settings", MODE_PRIVATE)
-                    .getInt("video_mode", 0) % 2 == 0 ? "MJPEG" : "YUYV");
+                    .getInt("video_mode", 1) % 2 == 0 ? "MJPEG" : "YUYV");
         }
     }
 
     private void chooseVideoMode() {
-        final String[] options = {"MJPEG 640×480", "YUYV 640×480",
+        final String[] options = {"MJPEG 640×480", "YUYV авто (макс.)",
                 "MJPEG 320×240", "YUYV 320×240"};
-        int selected = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 0);
+        int selected = getSharedPreferences("settings", MODE_PRIVATE).getInt("video_mode", 1);
         new AlertDialog.Builder(this)
                 .setTitle("Формат USB-видео")
                 .setSingleChoiceItems(options, selected, (dialog, which) -> {
@@ -754,6 +982,7 @@ public final class MainActivity extends CameraActivity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        scheduleAutoUsbConnect("activity resumed", 1450);
         updateUsbDetails();
         if (meter != null && micEnabled && !recording &&
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO)
@@ -763,12 +992,15 @@ public final class MainActivity extends CameraActivity {
 
     @Override protected void onPause() {
         foreground = false;
+        cancelAutoUsbConnect();
+        stopRecordBlink();
         if (recording) stopVideo();
         if (meter != null) meter.stopAll();
         super.onPause();
     }
 
     @Override protected void onDestroy() {
+        cancelAutoUsbConnect();
         ui.removeCallbacksAndMessages(null);
         if (meter != null) meter.stopAll();
         if (livePreview != null) livePreview.close();
