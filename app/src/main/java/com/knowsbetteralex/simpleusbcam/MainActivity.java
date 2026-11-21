@@ -94,6 +94,7 @@ public final class MainActivity extends CameraActivity {
     private float screenFps;
     private long recordBeganAt;
     private boolean recordingActive;
+    private boolean videoEncoderOk;
     private final Runnable previewTick = new Runnable() {
         @Override public void run() {
             if (livePreview != null) {
@@ -352,6 +353,10 @@ public final class MainActivity extends CameraActivity {
                 case OPENED:
                     pendingMicChange = false;
                     recordButton.setEnabled(false);
+                    AusbcVideoFix.Result encoderFix = AusbcVideoFix.apply(camera);
+                    videoEncoderOk = encoderFix.success;
+                    addTrace("ENCODER CHECK: " + (videoEncoderOk ? "OK " : "ERROR ") +
+                            encoderFix.detail);
                     fpsPreviousFrames = 0;
                     fpsPreviousDisplayed = 0;
                     fpsLastAt = 0;
@@ -369,14 +374,18 @@ public final class MainActivity extends CameraActivity {
                             meter.offerAac(data, offset, size);
                     });
                     cameraView.setRotation(rotation * 90f);
-                    showStatus("UVC открыт • ожидаем первые видеокадры...");
+                    showStatus(videoEncoderOk
+                            ? "UVC открыт • ожидаем первые видеокадры..."
+                            : "Фото работает, но запись заблокирована: ошибка видеокодера");
                     ui.postDelayed(() -> {
-                        if (isCameraOpened() && livePreview.getFrames() > 0 && !pendingMicChange)
+                        if (isCameraOpened() && livePreview.getFrames() > 0 &&
+                                !pendingMicChange && videoEncoderOk)
                             recordButton.setEnabled(true);
                     }, 500);
                     updateUsbDetails();
                     break;
                 case CLOSED:
+                    videoEncoderOk = false;
                     addTrace("UVC CLOSED");
                     camera.removePreviewDataCallBack(livePreview);
                     livePreview.reset();
@@ -386,6 +395,7 @@ public final class MainActivity extends CameraActivity {
                     showStatus("USB-камера отключена");
                     break;
                 case ERROR:
+                    videoEncoderOk = false;
                     addTrace("UVC ERROR: " + message);
                     recordButton.setEnabled(false);
                     livePreview.reset();
@@ -454,6 +464,11 @@ public final class MainActivity extends CameraActivity {
     }
 
     private void startVideo() {
+        if (!videoEncoderOk) {
+            showStatus("Запись отключена: неподдерживаемая конфигурация AUSBC H264.");
+            addTrace("Recording blocked due to failed H264 geometry workaround");
+            return;
+        }
         if (livePreview == null || livePreview.getFrames() < 3
                 || livePreview.getLastFrameAgeMs() > 2500) {
             showStatus("Нет живых кадров. MP4 пока записывать нельзя.");
@@ -518,8 +533,8 @@ public final class MainActivity extends CameraActivity {
         recordingActive = false;
         ui.removeCallbacks(timeTick);
         recordButton.setText("● Запись");
-        recordButton.setEnabled(livePreview != null && livePreview.getFrames() > 0
-                && !pendingMicChange);
+        recordButton.setEnabled(videoEncoderOk && livePreview != null
+                && livePreview.getFrames() > 0 && !pendingMicChange);
         recordButton.setBackgroundTintList(ColorStateList.valueOf(0xffb53d4a));
         micButton.setEnabled(true);
         meter.stopDecoder();
@@ -621,7 +636,8 @@ public final class MainActivity extends CameraActivity {
                 " • журнал ↗");
             if (isCameraOpened() && livePreview != null && livePreview.getFrames() > 2
                     && livePreview.getLastFrameAgeMs() < 2500
-                    && !recording && !pendingMicChange) recordButton.setEnabled(true);
+                    && !recording && !pendingMicChange && videoEncoderOk)
+                recordButton.setEnabled(true);
         }
     }
 
@@ -645,6 +661,7 @@ public final class MainActivity extends CameraActivity {
                 "\nFPS USB / screen: " + cameraFps + " / " + screenFps +
                 "\nPreview: " + (livePreview == null ? "-" :
                         (livePreview.isSoftwareEnabled() ? "software" : "native")) +
+                "\nH264 geometry fix: " + (videoEncoderOk ? "OK" : "FAILED") +
                 "\nLast frame age (ms): " + (livePreview == null ? "-" : livePreview.getLastFrameAgeMs()) +
                 "\n\nEvents:\n" + trace;
         new AlertDialog.Builder(this)
