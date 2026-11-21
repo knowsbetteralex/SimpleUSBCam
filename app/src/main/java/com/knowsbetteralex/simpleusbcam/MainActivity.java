@@ -109,6 +109,8 @@ public final class MainActivity extends CameraActivity {
     private boolean maxResolutionAttempted;
     private boolean maxResolutionUpgrade;
     private boolean maxResolutionFallback;
+    private int requestedMaxWidth;
+    private int requestedMaxHeight;
     private boolean usbConnectRequestPending;
     private long lastUsbConnectRequest;
     private Runnable automaticUsbRetry;
@@ -126,8 +128,19 @@ public final class MainActivity extends CameraActivity {
             if (livePreview != null) {
                 calculateFps();
                 updateUsbDetails();
-                if (isCameraOpened() && livePreview.getFrames() == 0
-                        && !recording) {
+                if (isCameraOpened() && !recording) {
+                    MultiCameraClient.ICamera activeCamera = getCurrentCamera();
+                    CameraRequest activeRequest = activeCamera == null ? null :
+                            activeCamera.getCameraRequest();
+                    if (maxResolutionUpgrade && livePreview.getFrames() > 0 &&
+                            activeRequest != null &&
+                            activeRequest.getPreviewWidth() == requestedMaxWidth &&
+                            activeRequest.getPreviewHeight() == requestedMaxHeight) {
+                        maxResolutionUpgrade = false;
+                        addTrace("Max YUYV working: " + requestedMaxWidth + "x"
+                                + requestedMaxHeight);
+                    }
+                    if (livePreview.getFrames() == 0) {
                     long silence = SystemClock.elapsedRealtime() - livePreview.getOpenedAt();
                     if (maxResolutionUpgrade && !maxResolutionFallback &&
                             silence > 5500) {
@@ -138,6 +151,7 @@ public final class MainActivity extends CameraActivity {
                         getCurrentCamera().updateResolution(640, 480);
                     } else if (silence > 3000) {
                         showStatus("UVC открыт, кадры ещё не поступают...");
+                    }
                     }
                 }
             }
@@ -462,7 +476,8 @@ public final class MainActivity extends CameraActivity {
                             : "Фото работает, но запись заблокирована: ошибка видеокодера");
                     ui.postDelayed(() -> {
                         if (isCameraOpened() && livePreview.getFrames() > 0 &&
-                                !pendingMicChange && videoEncoderOk)
+                                !pendingMicChange && videoEncoderOk &&
+                                !maxResolutionUpgrade)
                             recordButton.setEnabled(true);
                     }, 500);
                     updateUsbDetails();
@@ -558,6 +573,10 @@ public final class MainActivity extends CameraActivity {
     }
 
     private void startVideo() {
+        if (maxResolutionUpgrade) {
+            showStatus("Устанавливаем максимальное YUYV; запись пока недоступна");
+            return;
+        }
         if (!videoEncoderOk) {
             showStatus("Запись отключена: неподдерживаемая конфигурация AUSBC H264.");
             addTrace("Recording blocked due to failed H264 geometry workaround");
@@ -629,7 +648,8 @@ public final class MainActivity extends CameraActivity {
         ui.removeCallbacks(timeTick);
         recordButton.setText("● Запись");
         recordButton.setEnabled(videoEncoderOk && livePreview != null
-                && livePreview.getFrames() > 0 && !pendingMicChange);
+                && livePreview.getFrames() > 0 && !pendingMicChange &&
+                !maxResolutionUpgrade);
         recordButton.setBackgroundTintList(ColorStateList.valueOf(0xffb53d4a));
         micButton.setEnabled(true);
         meter.stopDecoder();
@@ -782,6 +802,8 @@ public final class MainActivity extends CameraActivity {
                 && largest.getHeight() == request.getPreviewHeight()) return;
         final int targetWidth = largest.getWidth();
         final int targetHeight = largest.getHeight();
+        requestedMaxWidth = targetWidth;
+        requestedMaxHeight = targetHeight;
         maxResolutionUpgrade = true;
         showStatus("Выбираем максимальное YUYV: " + targetWidth + "×" + targetHeight);
         ui.postDelayed(() -> {
@@ -877,7 +899,8 @@ public final class MainActivity extends CameraActivity {
                 " • журнал ↗");
             if (isCameraOpened() && livePreview != null && livePreview.getFrames() > 2
                     && livePreview.getLastFrameAgeMs() < 2500
-                    && !recording && !pendingMicChange && videoEncoderOk)
+                    && !recording && !pendingMicChange && videoEncoderOk &&
+                    !maxResolutionUpgrade)
                 recordButton.setEnabled(true);
         }
     }
