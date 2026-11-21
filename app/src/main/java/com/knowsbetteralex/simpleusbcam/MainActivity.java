@@ -514,7 +514,13 @@ public final class MainActivity extends CameraActivity {
                     recordButton.setEnabled(false);
                     livePreview.reset();
                     if (recording) stopVideo();
-                    showStatus("Ошибка USB: " + (message == null ? "неизвестно" : message));
+                    if (message != null && message.contains("result=-99")) {
+                        showStatus("UVC -99: камера не открылась. Отключите и снова подключите USB.");
+                        addTrace("Open failure -99: check single USB connection / native control block");
+                    } else {
+                        showStatus("Ошибка USB: " +
+                                (message == null ? "неизвестно" : message));
+                    }
                     updateUsbDetails();
                     break;
                 default: break;
